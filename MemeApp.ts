@@ -14,9 +14,14 @@ import { SlashCommandContext } from "@rocket.chat/apps-engine/definition/slashco
 import { IAppInfo } from "@rocket.chat/apps-engine/definition/metadata";
 import { ISlashCommand } from "@rocket.chat/apps-engine/definition/slashcommands";
 
-const apiUrl: string = "https://memegen.link/api/templates/";
+interface MemesHash {
+    [name: string]: { title: string; url: string; name: string };
+}
 
 export class MemeGeneratorApp extends App {
+    private availableMemes: MemesHash;
+    private memelinkAPIURL: string = "https://memegen.link/api/templates/";
+
     constructor(info: IAppInfo, logger: ILogger, accessors: IAppAccessors) {
         super(info, logger, accessors);
     }
@@ -25,11 +30,60 @@ export class MemeGeneratorApp extends App {
         configurationExtend: IConfigurationExtend,
         environmentRead: IEnvironmentRead
     ): Promise<void> {
+        await this.updateAvailableMemes();
+        // setInterval(() => {
+        //     this.updateAvailableMemes();
+        // }, 5 * 60 * 1000);
+
         configurationExtend.slashCommands.provideSlashCommand(
-            new MemeCommand(this)
+            new MemeCommand(this, this.memelinkAPIURL)
         );
-        configurationExtend.slashCommands.provideSlashCommand(
-            new MemeListCommand(this)
+    }
+
+    public async getAvailableMemes(): Promise<MemesHash> {
+        if (
+            !!this.availableMemes &&
+            Object.keys(this.availableMemes).length > 0
+        ) {
+            return this.availableMemes;
+        }
+
+        const memes = await this.catchAvailableMemes(this.getAccessors().http);
+        this.availableMemes = memes;
+        return memes;
+    }
+
+    private async catchAvailableMemes(http: IHttp): Promise<MemesHash> {
+        this.getLogger().debug("catching available memes...");
+
+        const response = await http.get(this.memelinkAPIURL);
+        if (response.statusCode != HttpStatusCode.OK || !response.data) {
+            this.getLogger().debug("catching available memes failed", response);
+            throw `Invalid response: ${response.statusCode}`;
+        }
+
+        let memes: MemesHash = {};
+        for (const title in response.data) {
+            const templateUrl = response.data[title];
+            const templateName = templateUrl.replace(this.memelinkAPIURL, "");
+
+            memes[templateName] = {
+                title,
+                url: templateUrl,
+                name: templateName
+            };
+        }
+
+        this.getLogger().debug(
+            "catching available memes finished successfully",
+            memes
+        );
+        return memes;
+    }
+
+    private async updateAvailableMemes(): Promise<void> {
+        this.availableMemes = await this.catchAvailableMemes(
+            this.getAccessors().http
         );
     }
 }
@@ -40,7 +94,10 @@ class MemeCommand implements ISlashCommand {
     public i18nParamsExample: string = "";
     public providesPreview: boolean = false;
 
-    constructor(private readonly app: App) {}
+    constructor(
+        private readonly app: MemeGeneratorApp,
+        private readonly apiUrl: string
+    ) {}
 
     public async executor(
         context: SlashCommandContext,
@@ -49,17 +106,33 @@ class MemeCommand implements ISlashCommand {
         http: IHttp,
         persist: IPersistence
     ): Promise<void> {
-        const args = context.getArguments();
+        const args = this.concatArgs(context.getArguments());
+        const availableMemes = await this.app.getAvailableMemes();
+
         const builder = modify
             .getCreator()
             .startMessage()
             .setSender(context.getSender())
             .setRoom(context.getRoom());
 
+        if (args.length > 1 && args[0] === "--list") {
+            builder.setText(
+                Object.values(availableMemes).reduce(
+                    (accumulator, template) =>
+                        `${accumulator}*${template.name}*: _${template.title}_\n`,
+                    ""
+                )
+            );
+            modify
+                .getNotifier()
+                .notifyUser(context.getSender(), builder.getMessage());
+            return;
+        }
+
         if (args.length < 2) {
             this.app.getLogger().debug("Invalid arguments", args);
             builder.setText(
-                "Invalid arguments.\nUse the following format: `/meme template top-line bottom-line`\nFor a list of available templates, run `/meme-list`."
+                "Invalid arguments.\nUse the following format: `/meme template top-line bottom-line`\nFor a list of available templates, run `/meme --list`."
             );
             modify
                 .getNotifier()
@@ -71,15 +144,31 @@ class MemeCommand implements ISlashCommand {
         const line1 = args[1];
         const line2 = args.length > 2 ? args[2] : "";
 
-        this.app.getLogger().debug(args);
+        if (!availableMemes[meme]) {
+            this.app.getLogger().debug("Unknown meme", meme);
 
-        const memeUrl = `${apiUrl}${meme}/${line1}/${line2}`;
+            const availableMemesString = Object.keys(availableMemes).join(
+                "`, `"
+            );
+            builder.setText(
+                `Unknown meme.\nUse one of the following: \`${availableMemesString}\`.`
+            );
+
+            modify
+                .getNotifier()
+                .notifyUser(context.getSender(), builder.getMessage());
+
+            return;
+        }
+
+        const memeUrl = `${this.apiUrl}${meme}/${line1}/${line2}`;
 
         const response = await http.get(memeUrl);
         if (response.statusCode !== HttpStatusCode.OK || !response.data) {
             this.app
                 .getLogger()
                 .debug("Did not get a valid response", response);
+
             builder.setText(
                 `Failed to generate meme image (status = ${response.statusCode}). Did you use a valid template?`
             );
@@ -93,72 +182,42 @@ class MemeCommand implements ISlashCommand {
 
         builder.addAttachment({
             title: {
-                value: meme
+                value: availableMemes[meme].title
             },
             imageUrl: text
         });
 
         await modify.getCreator().finish(builder);
     }
-}
 
-class MemeListCommand implements ISlashCommand {
-    public command: string = "meme-list";
-    public i18nDescription: string = "Get a list of available memes";
-    public i18nParamsExample: string = "";
-    public providesPreview: boolean = false;
+    // TODO: handle quotes in the middle?
+    private concatArgs(args: string[]): string[] {
+        let newArgs: string[] = [];
+        for (let i = 0; i < args.length; i++) {
+            let arg: string = args[i];
 
-    private memesList: { title: string; url: string; name: string }[] = [];
+            if (arg.startsWith('"')) {
+                arg = arg.substring(1);
 
-    constructor(private readonly app: App) {}
+                while (true) {
+                    if (arg.endsWith('"')) {
+                        arg = arg.substring(0, arg.length - 1);
+                        break;
+                    }
 
-    public async executor(
-        context: SlashCommandContext,
-        read: IRead,
-        modify: IModify,
-        http: IHttp,
-        persist: IPersistence
-    ): Promise<void> {
-        const builder = modify
-            .getCreator()
-            .startMessage()
-            .setSender(context.getSender())
-            .setRoom(context.getRoom());
+                    i++;
+                    if (i >= args.length) {
+                        break;
+                    }
 
-        if (this.memesList.length === 0) {
-            const response = await http.get(apiUrl);
-            if (response.statusCode !== HttpStatusCode.OK || !response.data) {
-                this.app
-                    .getLogger()
-                    .debug("Did not get a valid response", response);
-                builder.setText("Failed to retrieve the meme template list.");
-                modify
-                    .getNotifier()
-                    .notifyUser(context.getSender(), builder.getMessage());
-                return;
+                    const nextArg: string = args[i];
+                    arg += ` ${nextArg}`;
+                }
             }
 
-            for (const title in response.data) {
-                const templateUrl = response.data[title];
-                const templateName = templateUrl.replace(apiUrl, "");
-
-                this.memesList.push({
-                    title,
-                    url: templateUrl,
-                    name: templateName
-                });
-            }
+            newArgs.push(arg);
         }
 
-        builder.setText(
-            this.memesList.reduce(
-                (accumulator, template) =>
-                    `${accumulator}*${template.name}*: _${template.title}_\n`,
-                ""
-            )
-        );
-        modify
-            .getNotifier()
-            .notifyUser(context.getSender(), builder.getMessage());
+        return newArgs;
     }
 }
