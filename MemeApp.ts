@@ -115,7 +115,7 @@ class MemeCommand implements ISlashCommand {
             .setSender(context.getSender())
             .setRoom(context.getRoom());
 
-        if (args.length > 1 && args[0] === "--list") {
+        if (args.length === 1 && args[0] === "list") {
             builder.setText(
                 Object.values(availableMemes).reduce(
                     (accumulator, template) =>
@@ -132,7 +132,7 @@ class MemeCommand implements ISlashCommand {
         if (args.length < 2) {
             this.app.getLogger().debug("Invalid arguments", args);
             builder.setText(
-                "Invalid arguments.\nUse the following format: `/meme template top-line bottom-line`\nFor a list of available templates, run `/meme --list`."
+                "Invalid arguments.\nUse the following format: `/meme template top-line bottom-line`\nFor a list of available templates, run `/meme list`."
             );
             modify
                 .getNotifier()
